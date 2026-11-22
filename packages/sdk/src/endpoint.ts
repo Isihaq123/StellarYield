@@ -34,6 +34,40 @@ export interface SdkEndpointConfig extends ApiRetryConfig {
   cacheStore?: ApiCacheStore;
 }
 
+/**
+ * Documented numeric boundaries for endpoint configuration.
+ * All bounds are inclusive. Values outside them are rejected before any state changes.
+ */
+export const ENDPOINT_LIMITS = {
+  /** Smallest accepted per-request timeout (ms). Zero is rejected. */
+  MIN_TIMEOUT_MS: 1,
+  /** Largest accepted timeout (ms). Matches the 32-bit signed limit of setTimeout, above which timers fire immediately. */
+  MAX_TIMEOUT_MS: 2_147_483_647,
+  /** Largest accepted retry count. Zero (no retries) is valid. */
+  MAX_RETRIES: 10,
+  /** Largest accepted base retry delay (ms). Zero is valid. */
+  MAX_RETRY_DELAY_MS: 60_000,
+  /** Upper cap applied to any computed exponential backoff delay (ms). */
+  MAX_BACKOFF_MS: 300_000,
+} as const;
+
+/**
+ * Computes exponential backoff `baseMs * 2^attempt` with checked arithmetic.
+ * Rounding: result is rounded down to a whole millisecond and saturates at
+ * `ENDPOINT_LIMITS.MAX_BACKOFF_MS`. Invalid input (negative, NaN, non-finite)
+ * yields 0, so the result is never NaN or Infinity.
+ */
+export function computeBackoffDelayMs(baseMs: number, attempt: number): number {
+  if (!Number.isFinite(baseMs) || baseMs <= 0) return 0;
+  if (!Number.isInteger(attempt) || attempt < 0) return 0;
+  const cap = ENDPOINT_LIMITS.MAX_BACKOFF_MS;
+  // 2^attempt would overflow the cap long before attempt 53; short-circuit.
+  if (attempt >= 31) return cap;
+  const raw = baseMs * 2 ** attempt;
+  if (!Number.isFinite(raw)) return cap;
+  return Math.min(Math.floor(raw), cap);
+}
+
 export interface EndpointValidationResult {
   valid: boolean;
   errors: string[];
@@ -113,23 +147,31 @@ export function validateEndpointConfig(config: unknown): EndpointValidationResul
 
   if (
     cfg.timeoutMs !== undefined &&
-    (typeof cfg.timeoutMs !== "number" || cfg.timeoutMs <= 0 || !Number.isFinite(cfg.timeoutMs))
+    (typeof cfg.timeoutMs !== "number" || !Number.isFinite(cfg.timeoutMs) ||
+      cfg.timeoutMs < ENDPOINT_LIMITS.MIN_TIMEOUT_MS ||
+      cfg.timeoutMs > ENDPOINT_LIMITS.MAX_TIMEOUT_MS)
   ) {
-    errors.push("timeoutMs must be a positive finite number.");
+    errors.push(
+      `timeoutMs must be a finite number between ${ENDPOINT_LIMITS.MIN_TIMEOUT_MS} and ${ENDPOINT_LIMITS.MAX_TIMEOUT_MS}.`
+    );
   }
 
   if (
     cfg.maxRetries !== undefined &&
-    (typeof cfg.maxRetries !== "number" || cfg.maxRetries < 0 || !Number.isInteger(cfg.maxRetries))
+    (typeof cfg.maxRetries !== "number" || !Number.isInteger(cfg.maxRetries) ||
+      cfg.maxRetries < 0 ||
+      cfg.maxRetries > ENDPOINT_LIMITS.MAX_RETRIES)
   ) {
-    errors.push("maxRetries must be a non-negative integer.");
+    errors.push(`maxRetries must be an integer between 0 and ${ENDPOINT_LIMITS.MAX_RETRIES}.`);
   }
 
   if (
     cfg.retryDelayMs !== undefined &&
-    (typeof cfg.retryDelayMs !== "number" || cfg.retryDelayMs < 0 || !Number.isFinite(cfg.retryDelayMs))
+    (typeof cfg.retryDelayMs !== "number" || !Number.isFinite(cfg.retryDelayMs) ||
+      cfg.retryDelayMs < 0 ||
+      cfg.retryDelayMs > ENDPOINT_LIMITS.MAX_RETRY_DELAY_MS)
   ) {
-    errors.push("retryDelayMs must be a non-negative number.");
+    errors.push(`retryDelayMs must be a finite number between 0 and ${ENDPOINT_LIMITS.MAX_RETRY_DELAY_MS}.`);
   }
 
   if (errors.length > 0) {
